@@ -120,7 +120,7 @@ update_state_file() {
     # Update the state file by cutting MAX_PICS lines from the top
     if (( $(wc -l "${STATE_FILE}" | cut -d ' ' -f1) > ${MAX_PICS} * ${NO_REPEAT_DAYS} ))
     then
-      sed -i '1,10d' "${STATE_FILE}"
+      sed -i "1,${MAX_PICS}d" "${STATE_FILE}"
     fi
 }
 
