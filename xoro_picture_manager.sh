@@ -17,7 +17,7 @@ UPLOAD_RETRIES="${UPLOAD_RETRIES:-10}"
 # Copy this amount of pics
 MAX_PICS="${MAX_PICS:-"100"}"
 # Do not copy the same pictures for this amount of days
-NO_REPEAT_DAYS="${NO_REPEAT_DAYS:-"28"}"
+NO_REPEAT_DAYS="${NO_REPEAT_DAYS:-"90"}"
 # File to save the last MAX_PICS * NO_REPEAT_DAYS file names to prevent showing the same files
 STATE_FILE="${STATE_FILE:-"/var/tmp/xoro_pictures.state"}"
 
