@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 set -x
 
 # Source the env file
@@ -73,7 +73,7 @@ upload_new_files_to_ftp() {
   touch "${STATE_FILE}"
 
   # Use cached picture list, filter by state file, randomize and limit
-  local IMAGES="$(grep -vf ${STATE_FILE} "${PICTURE_CACHE}" | sort --random-sort | head -n ${MAX_PICS})"
+  local IMAGES="$(grep -vf ${STATE_FILE} "${PICTURE_CACHE}" | shuf -n ${MAX_PICS})"
 
   # Check if any pictures available
   if [[ -z "${IMAGES}" ]]
