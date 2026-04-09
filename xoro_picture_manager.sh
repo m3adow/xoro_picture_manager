@@ -33,17 +33,24 @@ date_echo() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): ${1}"
 }
 
-count_available_pictures() {
-  # Count total pictures in directory matching same criteria as upload
-  # Uses same pipeline as upload but counts instead of listing
+discover_pictures() {
+  # Run expensive find command once and cache results in temp file
+  # This avoids multiple traversals of potentially large directory trees
   local PICTURE_DIR="${1}"
+  local CACHE_FILE="${2}"
 
-  # Same logic as upload_new_files_to_ftp but with wc -l at end
-  # Don't filter by state file here - we want total count
-  local TOTAL=$(find "${PICTURE_DIR}" -type f -exec file --mime-type {} \+ \
+  # Send logs to stderr to avoid polluting stdout (which is captured)
+  date_echo "Discovering pictures in ${PICTURE_DIR} (this may take a while for large collections)" >&2
+
+  # Find all images and save to cache file
+  find "${PICTURE_DIR}" -type f -exec file --mime-type {} \+ \
     | awk -F: '{if ($2 ~/image\//) print $1}' \
-    | wc -l)
+    > "${CACHE_FILE}"
 
+  local TOTAL=$(wc -l < "${CACHE_FILE}")
+  date_echo "Found ${TOTAL} total pictures" >&2
+
+  # Only output the count to stdout (this is what gets captured)
   echo "${TOTAL}"
 }
 
@@ -60,21 +67,21 @@ delete_all_ftp_files() {
 }
 
 upload_new_files_to_ftp() {
+  local PICTURE_CACHE="${1}"
+
   # Make sure the state file exists
   touch "${STATE_FILE}"
 
-  # Find all images in given folder, sort randomly
-  local IMAGES="$(find ${1} -type f -exec file --mime-type {} \+ | awk -F: '{if ($2 ~/image\//) print $1}' \
-    | grep -vf ${STATE_FILE} | sort --random-sort | head -n ${MAX_PICS})"
+  # Use cached picture list, filter by state file, randomize and limit
+  local IMAGES="$(grep -vf ${STATE_FILE} "${PICTURE_CACHE}" | sort --random-sort | head -n ${MAX_PICS})"
 
   # Check if any pictures available
   if [[ -z "${IMAGES}" ]]
   then
     date_echo "WARNING: No new pictures available (all in state file). Resetting state to start fresh cycle."
     > "${STATE_FILE}"  # Empty the state file
-    # Retry finding pictures now that state is clear
-    IMAGES="$(find ${1} -type f -exec file --mime-type {} \+ | awk -F: '{if ($2 ~/image\//) print $1}' \
-      | sort --random-sort | head -n ${MAX_PICS})"
+    # Retry using cached list now that state is clear
+    IMAGES="$(cat "${PICTURE_CACHE}" | sort --random-sort | head -n ${MAX_PICS})"
 
     if [[ -z "${IMAGES}" ]]
     then
@@ -246,22 +253,26 @@ trap '' SIGINT SIGHUP SIGQUIT SIGTERM SIGSTOP
 
 if [[ -n ${2} && -d ${2} ]]
 then
-  # Count total available pictures for threshold calculation
-  date_echo "Discovering available pictures in ${2}"
-  TOTAL_AVAILABLE_PICS=$(count_available_pictures "${2}")
+  # Create temp file for caching picture list (avoids multiple expensive find operations)
+  PICTURE_CACHE=$(mktemp)
+  trap "rm -f ${PICTURE_CACHE}" EXIT
+
+  # Discover all pictures once and cache results
+  TOTAL_AVAILABLE_PICS=$(discover_pictures "${2}" "${PICTURE_CACHE}")
 
   # Handle edge case: no pictures found
   if (( TOTAL_AVAILABLE_PICS == 0 ))
   then
     date_echo "WARNING: No pictures found in ${2}, skipping upload"
   else
-    date_echo "Found ${TOTAL_AVAILABLE_PICS} total pictures"
-
     delete_all_ftp_files
-    upload_new_files_to_ftp "${2}"
+    upload_new_files_to_ftp "${PICTURE_CACHE}"
     cleanup_state_file
     update_state_file "${TOTAL_AVAILABLE_PICS}"
   fi
+
+  # Cleanup temp file
+  rm -f "${PICTURE_CACHE}"
 fi
 
 #rename_ftp_files
