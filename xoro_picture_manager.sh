@@ -16,14 +16,35 @@ UPLOAD_RETRIES="${UPLOAD_RETRIES:-10}"
 
 # Copy this amount of pics
 MAX_PICS="${MAX_PICS:-"100"}"
-# Do not copy the same pictures for this amount of days
-NO_REPEAT_DAYS="${NO_REPEAT_DAYS:-"90"}"
-# File to save the last MAX_PICS * NO_REPEAT_DAYS file names to prevent showing the same files
+# Show this percentage of all available pictures before allowing repeats
+# e.g., 80 means 80% of collection must be shown before oldest pictures can be re-uploaded
+COVERAGE_PERCENTAGE="${COVERAGE_PERCENTAGE:-"80"}"
+# File to save uploaded file paths to prevent repeats until COVERAGE_PERCENTAGE met
 STATE_FILE="${STATE_FILE:-"/var/tmp/xoro_pictures.state"}"
 
+# Validate COVERAGE_PERCENTAGE is between 1 and 100
+if (( COVERAGE_PERCENTAGE < 1 || COVERAGE_PERCENTAGE > 100 ))
+then
+  echo "ERROR: COVERAGE_PERCENTAGE must be between 1 and 100, got ${COVERAGE_PERCENTAGE}."
+  exit 1
+fi
 
 date_echo() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): ${1}"
+}
+
+count_available_pictures() {
+  # Count total pictures in directory matching same criteria as upload
+  # Uses same pipeline as upload but counts instead of listing
+  local PICTURE_DIR="${1}"
+
+  # Same logic as upload_new_files_to_ftp but with wc -l at end
+  # Don't filter by state file here - we want total count
+  local TOTAL=$(find "${PICTURE_DIR}" -type f -exec file --mime-type {} \+ \
+    | awk -F: '{if ($2 ~/image\//) print $1}' \
+    | wc -l)
+
+  echo "${TOTAL}"
 }
 
 delete_all_ftp_files() {
@@ -46,6 +67,22 @@ upload_new_files_to_ftp() {
   local IMAGES="$(find ${1} -type f -exec file --mime-type {} \+ | awk -F: '{if ($2 ~/image\//) print $1}' \
     | grep -vf ${STATE_FILE} | sort --random-sort | head -n ${MAX_PICS})"
 
+  # Check if any pictures available
+  if [[ -z "${IMAGES}" ]]
+  then
+    date_echo "WARNING: No new pictures available (all in state file). Resetting state to start fresh cycle."
+    > "${STATE_FILE}"  # Empty the state file
+    # Retry finding pictures now that state is clear
+    IMAGES="$(find ${1} -type f -exec file --mime-type {} \+ | awk -F: '{if ($2 ~/image\//) print $1}' \
+      | sort --random-sort | head -n ${MAX_PICS})"
+
+    if [[ -z "${IMAGES}" ]]
+    then
+      date_echo "ERROR: No pictures found in directory at all"
+      return
+    fi
+  fi
+
   local FAILURE_COUNT=0
   IFS=$'\n'
   for MYFILE in ${IMAGES}
@@ -61,7 +98,7 @@ upload_new_files_to_ftp() {
       ((FAILURE_COUNT++))
     fi
 
-    # Add the file name to the STATE_FILE to prevent it from being shown the next NO_REPEAT_DAYS
+    # Add the file name to the STATE_FILE to prevent repeats until coverage threshold met
     echo "${MYFILE}" >> "${STATE_FILE}"
 
     # Try the next file until retries are reached
@@ -116,11 +153,73 @@ reactivate_xoro() {
   adb kill-server
 }
 
-update_state_file() {
-    # Update the state file by cutting MAX_PICS lines from the top
-    if (( $(wc -l "${STATE_FILE}" | cut -d ' ' -f1) > ${MAX_PICS} * ${NO_REPEAT_DAYS} ))
+cleanup_state_file() {
+    # Remove entries from state file for pictures that no longer exist
+    # This prevents state file from growing with stale entries
+
+    if [[ ! -f "${STATE_FILE}" ]]
     then
-      sed -i "1,${MAX_PICS}d" "${STATE_FILE}"
+      return
+    fi
+
+    local TEMP_STATE=$(mktemp)
+    local REMOVED_COUNT=0
+
+    while IFS= read -r PICTURE_PATH
+    do
+      if [[ -f "${PICTURE_PATH}" ]]
+      then
+        echo "${PICTURE_PATH}" >> "${TEMP_STATE}"
+      else
+        ((REMOVED_COUNT++))
+      fi
+    done < "${STATE_FILE}"
+
+    if (( REMOVED_COUNT > 0 ))
+    then
+      date_echo "Cleaned ${REMOVED_COUNT} stale entries from state file"
+      mv "${TEMP_STATE}" "${STATE_FILE}"
+    else
+      rm "${TEMP_STATE}"
+    fi
+}
+
+update_state_file() {
+    local TOTAL_PICS="${1}"
+    local STATE_COUNT=$(wc -l "${STATE_FILE}" | cut -d ' ' -f1)
+
+    # Calculate coverage threshold based on total available pictures
+    local THRESHOLD=$(( TOTAL_PICS * COVERAGE_PERCENTAGE / 100 ))
+
+    # Ensure threshold is at least MAX_PICS to prevent immediate cycling
+    if (( THRESHOLD < MAX_PICS ))
+    then
+      THRESHOLD=${MAX_PICS}
+    fi
+
+    # Don't let threshold exceed total available pictures
+    if (( THRESHOLD > TOTAL_PICS ))
+    then
+      THRESHOLD=${TOTAL_PICS}
+    fi
+
+    date_echo "State tracking: ${STATE_COUNT} uploaded, ${TOTAL_PICS} total available, threshold ${THRESHOLD} (${COVERAGE_PERCENTAGE}%)"
+
+    # Calculate how many to actually remove (may be less than MAX_PICS)
+    local ENTRIES_TO_REMOVE=${MAX_PICS}
+    if (( STATE_COUNT < MAX_PICS ))
+    then
+      ENTRIES_TO_REMOVE=${STATE_COUNT}
+    fi
+
+    # Only remove oldest entries if we've met the coverage threshold
+    if (( STATE_COUNT >= THRESHOLD && ENTRIES_TO_REMOVE > 0 ))
+    then
+      date_echo "Coverage threshold met, releasing oldest ${ENTRIES_TO_REMOVE} pictures back to pool"
+      sed -i "1,${ENTRIES_TO_REMOVE}d" "${STATE_FILE}"
+    else
+      local REMAINING=$(( THRESHOLD - STATE_COUNT ))
+      date_echo "Building coverage: ${REMAINING} more unique pictures until threshold"
     fi
 }
 
@@ -147,9 +246,22 @@ trap '' SIGINT SIGHUP SIGQUIT SIGTERM SIGSTOP
 
 if [[ -n ${2} && -d ${2} ]]
 then
-  delete_all_ftp_files
-  upload_new_files_to_ftp "${2}" "${MAX_PICS}"
-  update_state_file
+  # Count total available pictures for threshold calculation
+  date_echo "Discovering available pictures in ${2}"
+  TOTAL_AVAILABLE_PICS=$(count_available_pictures "${2}")
+
+  # Handle edge case: no pictures found
+  if (( TOTAL_AVAILABLE_PICS == 0 ))
+  then
+    date_echo "WARNING: No pictures found in ${2}, skipping upload"
+  else
+    date_echo "Found ${TOTAL_AVAILABLE_PICS} total pictures"
+
+    delete_all_ftp_files
+    upload_new_files_to_ftp "${2}"
+    cleanup_state_file
+    update_state_file "${TOTAL_AVAILABLE_PICS}"
+  fi
 fi
 
 #rename_ftp_files
