@@ -104,9 +104,9 @@ upload_new_files_to_ftp() {
     then
       # Only add to state file if upload succeeded
       echo "${MYFILE}" >> "${STATE_FILE}"
-      ((SUCCESS_COUNT++))
+      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     else
-      ((FAILURE_COUNT++))
+      FAILURE_COUNT=$((FAILURE_COUNT + 1))
       date_echo "ERROR: Failed to upload '${MYFILE}'"
     fi
 
@@ -188,7 +188,7 @@ cleanup_state_file() {
       then
         echo "${PICTURE_PATH}" >> "${TEMP_STATE}"
       else
-        ((REMOVED_COUNT++))
+        REMOVED_COUNT=$((REMOVED_COUNT + 1))
       fi
     done < "${STATE_FILE}"
 
