@@ -91,6 +91,7 @@ upload_new_files_to_ftp() {
   fi
 
   local FAILURE_COUNT=0
+  local SUCCESS_COUNT=0
   IFS=$'\n'
   for MYFILE in ${IMAGES}
   do
@@ -99,29 +100,38 @@ upload_new_files_to_ftp() {
 
     date_echo "Uploading '${MYFILE}' as '${NEW_FILENAME}'"
     # This command may fail when space is running low
-    curl --silent --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
-    if [[ $? -ne 0 ]]
+    if curl --silent --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
     then
+      # Only add to state file if upload succeeded
+      echo "${MYFILE}" >> "${STATE_FILE}"
+      ((SUCCESS_COUNT++))
+    else
       ((FAILURE_COUNT++))
+      date_echo "ERROR: Failed to upload '${MYFILE}'"
     fi
-
-    # Add the file name to the STATE_FILE to prevent repeats until coverage threshold met
-    echo "${MYFILE}" >> "${STATE_FILE}"
 
     # Try the next file until retries are reached
     if (( $FAILURE_COUNT < $UPLOAD_RETRIES ))
     then
       continue
     else
+      date_echo "Upload retry limit reached (${UPLOAD_RETRIES} failures)"
       break
     fi
   done
+
+  date_echo "Upload complete: ${SUCCESS_COUNT} succeeded, ${FAILURE_COUNT} failed"
 }
 
 reactivate_xoro() {
   date_echo "Reactivating Xoro"
+
   # Connect to Xoro
-  adb connect ${XORO_HOST}
+  if ! adb connect ${XORO_HOST}
+  then
+    date_echo "ERROR: Failed to connect to device via ADB at ${XORO_HOST}"
+    return 1
+  fi
   # Give ADB time to REALLY connect
   sleep 2
 
