@@ -8,3 +8,7 @@ I added a state file recently and decided I wanted to add it to a Git repo to
 see its history. Maybe someone else will have a use for it too.
 
 *It's not nice, it's organically grown, but it works.*
+
+## Development
+
+Run `pre-commit install` once to lint the script with shellcheck on every commit.
