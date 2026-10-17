@@ -27,7 +27,8 @@ ALLOWED_MIME_TYPES="${ALLOWED_MIME_TYPES:-"image/jpeg"}"
 STORAGE="${STORAGE:-internal}"
 # Max seconds to wait for the frame after a reboot
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-"300"}"
-UPLOAD_RETRIES="${UPLOAD_RETRIES:-10}"
+# Abort uploading after this many failures (formerly UPLOAD_RETRIES)
+MAX_UPLOAD_FAILURES="${MAX_UPLOAD_FAILURES:-"${UPLOAD_RETRIES:-"10"}"}"
 
 # Copy this amount of pics
 MAX_PICS="${MAX_PICS:-"100"}"
@@ -39,7 +40,7 @@ STATE_FILE="${STATE_FILE:-"/var/tmp/xoro_pictures.state"}"
 LOCK_FILE="${LOCK_FILE:-"${STATE_FILE}.lock"}"
 CURL_OPTS=(--silent --show-error --globoff --ftp-method nocwd --connect-timeout 10 --max-time 300)
 
-for VAR in XORO_PORT BOOT_TIMEOUT UPLOAD_RETRIES MAX_PICS COVERAGE_PERCENTAGE
+for VAR in XORO_PORT BOOT_TIMEOUT MAX_UPLOAD_FAILURES MAX_PICS COVERAGE_PERCENTAGE
 do
   if [[ ! "${!VAR}" =~ ^[1-9][0-9]*$ ]]
   then
@@ -93,7 +94,8 @@ discover_pictures() {
         { sub(/^ /, "", $2); if ($2 in ok) print $1 }' \
     > "${CACHE_FILE}"
 
-  local TOTAL=$(wc -l < "${CACHE_FILE}")
+  local TOTAL
+  TOTAL="$(wc -l < "${CACHE_FILE}")"
   date_echo "Found ${TOTAL} total pictures" >&2
 
   # Only output the count to stdout (this is what gets captured)
@@ -169,12 +171,12 @@ upload_new_files_to_ftp() {
       date_echo "ERROR: Failed to upload '${MYFILE}'"
     fi
 
-    # Try the next file until retries are reached
-    if (( $FAILURE_COUNT < $UPLOAD_RETRIES ))
+    # Try the next file until the failure limit is reached
+    if (( FAILURE_COUNT < MAX_UPLOAD_FAILURES ))
     then
       continue
     else
-      date_echo "Upload retry limit reached (${UPLOAD_RETRIES} failures)"
+      date_echo "Upload failure limit reached (${MAX_UPLOAD_FAILURES} failures)"
       break
     fi
   done <<< "${IMAGES}"
@@ -251,7 +253,8 @@ cleanup_state_file() {
       return
     fi
 
-    local TEMP_STATE=$(mktemp)
+    local TEMP_STATE
+    TEMP_STATE="$(mktemp "${STATE_FILE}.XXXXXX")"
     local REMOVED_COUNT=0
 
     while IFS= read -r PICTURE_PATH
@@ -275,7 +278,8 @@ cleanup_state_file() {
 
 update_state_file() {
     local TOTAL_PICS="${1}"
-    local STATE_COUNT=$(wc -l "${STATE_FILE}" | cut -d ' ' -f1)
+    local STATE_COUNT
+    STATE_COUNT="$(wc -l < "${STATE_FILE}")"
 
     # Calculate coverage threshold based on total available pictures
     local THRESHOLD=$(( TOTAL_PICS * COVERAGE_PERCENTAGE / 100 ))
@@ -363,6 +367,5 @@ then
   fi
 fi
 
-#rename_ftp_files
 reactivate_xoro
 date_echo "Ended"
