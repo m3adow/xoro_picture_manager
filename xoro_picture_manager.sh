@@ -14,8 +14,10 @@ XORO_PORT="${XORO_PORT:-"2121"}"
 
 # Full prefix will be '$PREFIX_$RANDOM__' (two underscores)
 PREFIX="${PREFIX:-"XPM"}"
-# Everything not being "sd" or "SD" is handled the same
+# Anything but "sd" (any case) means internal storage
 STORAGE="${STORAGE:-internal}"
+# Max seconds to wait for the frame after a reboot
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-"300"}"
 UPLOAD_RETRIES="${UPLOAD_RETRIES:-10}"
 
 # Copy this amount of pics
@@ -135,8 +137,11 @@ upload_new_files_to_ftp() {
 reactivate_xoro() {
   date_echo "Reactivating Xoro"
 
+  local ADB_SERIAL="${XORO_HOST}:5555"
+  local GALLERY_ACTIVITY="com.allwinner.theatreplayer.album/.ui.GalleryActivity"
+
   # Connect to Xoro
-  if ! adb connect ${XORO_HOST}
+  if ! adb connect "${XORO_HOST}"
   then
     date_echo "ERROR: Failed to connect to device via ADB at ${XORO_HOST}"
     return 1
@@ -146,34 +151,44 @@ reactivate_xoro() {
 
   # Restart the device (couldn't figure out how to reindex files after rename)
   # Has to be OR'd with true due to -e
-  adb shell reboot
+  adb -s "${ADB_SERIAL}" shell reboot || true
   # Sometimes reboot returns too fast, so wait 5 secs to be sure device is offline
   sleep 5
   adb kill-server
 
   # Wait for the device to become responsive again
-  while ! nc -z ${XORO_HOST} 5555; do
-      sleep 5 # wait for 1/10 of the second before check again
+  local WAITED=0
+  until nc -z -w 5 "${XORO_HOST}" 5555
+  do
+    if (( WAITED >= BOOT_TIMEOUT ))
+    then
+      date_echo "ERROR: ${XORO_HOST} did not come back within ${BOOT_TIMEOUT} seconds"
+      return 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
   done
   # Sleep additional time afterwards to be safe
   sleep 5
 
-  adb connect ${XORO_HOST}
+  adb connect "${XORO_HOST}"
   # Start the Gallery activity, no idea why it fails sometimes
-  adb shell "am start com.allwinner.theatreplayer.album/.ui.GalleryActivity" || \
-    sleep 5; adb shell "am start com.allwinner.theatreplayer.album/.ui.GalleryActivity"
+  adb -s "${ADB_SERIAL}" shell "am start ${GALLERY_ACTIVITY}" || {
+    sleep 5
+    adb -s "${ADB_SERIAL}" shell "am start ${GALLERY_ACTIVITY}"
+  }
   # The app takes some time to start
   sleep 5
   # Send three "RIGHT" key strokes, going to internal storage
   # More than two in a row don't get detected properly sometimes
-  adb shell "input keyevent 22 / 22"
+  adb -s "${ADB_SERIAL}" shell "input keyevent 22 22"
   sleep 1
-  adb shell "input keyevent 22"
+  adb -s "${ADB_SERIAL}" shell "input keyevent 22"
   # If SD is used, send one additional stroke
-  if [[ "${STORAGE}" =~ "[sS][Dd]" ]]
+  if [[ "${STORAGE,,}" == "sd" ]]
   then
     sleep 1
-    adb shell "input keyevent 22"
+    adb -s "${ADB_SERIAL}" shell "input keyevent 22"
   fi
   # Stop adb again
   adb kill-server
