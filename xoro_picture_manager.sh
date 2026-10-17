@@ -1,8 +1,15 @@
 #!/bin/bash
 set -Eeuo pipefail
 
+if (( $# < 1 || $# > 2 ))
+then
+  echo "Usage: ${0} <values.env> [picture directory]" >&2
+  exit 1
+fi
+
 # Source the env file
-source ${1}
+# shellcheck source=/dev/null
+source "${1}"
 
 if [[ "${DEBUG:-false}" == "true" ]]
 then
@@ -29,12 +36,34 @@ MAX_PICS="${MAX_PICS:-"100"}"
 COVERAGE_PERCENTAGE="${COVERAGE_PERCENTAGE:-"80"}"
 # File to save uploaded file paths to prevent repeats until COVERAGE_PERCENTAGE met
 STATE_FILE="${STATE_FILE:-"/var/tmp/xoro_pictures.state"}"
+LOCK_FILE="${LOCK_FILE:-"${STATE_FILE}.lock"}"
+CURL_OPTS=(--silent --show-error --globoff --ftp-method nocwd --connect-timeout 10 --max-time 300)
+
+for VAR in XORO_PORT BOOT_TIMEOUT UPLOAD_RETRIES MAX_PICS COVERAGE_PERCENTAGE
+do
+  if [[ ! "${!VAR}" =~ ^[1-9][0-9]*$ ]]
+  then
+    echo "ERROR: ${VAR} must be a positive integer, got '${!VAR}'." >&2
+    exit 1
+  fi
+done
 
 # Validate COVERAGE_PERCENTAGE is between 1 and 100
 if (( COVERAGE_PERCENTAGE < 1 || COVERAGE_PERCENTAGE > 100 ))
 then
-  echo "ERROR: COVERAGE_PERCENTAGE must be between 1 and 100, got ${COVERAGE_PERCENTAGE}."
+  echo "ERROR: COVERAGE_PERCENTAGE must be between 1 and 100, got ${COVERAGE_PERCENTAGE}." >&2
   exit 1
+fi
+
+PICTURE_DIR=""
+if (( $# == 2 ))
+then
+  if [[ ! -d "${2}" ]]
+  then
+    echo "ERROR: Picture directory '${2}' does not exist." >&2
+    exit 1
+  fi
+  PICTURE_DIR="$(realpath "${2}")"
 fi
 
 date_echo() {
@@ -42,6 +71,11 @@ date_echo() {
 }
 
 trap 'RC=$?; date_echo "ERROR: \"${BASH_COMMAND}\" failed with exit code ${RC} at line ${LINENO}" >&2' ERR
+
+# Keep the lock fd away from the daemonized adb server
+adb() {
+  command adb "$@" 9>&-
+}
 
 discover_pictures() {
   # Run expensive find command once and cache results in temp file
@@ -66,19 +100,22 @@ discover_pictures() {
   echo "${TOTAL}"
 }
 
-delete_all_ftp_files() {
+delete_uploaded_ftp_files() {
   local CURL_FILES
-  CURL_FILES="$(curl --ftp-method nocwd --silent --show-error --list-only "${XORO_URL}")"
+  CURL_FILES="$(curl "${CURL_OPTS[@]}" --list-only "${XORO_URL}")"
   local FTP_FILE
   while IFS= read -r FTP_FILE
   do
-    if [[ -z "${FTP_FILE}" ]]
+    if [[ "${FTP_FILE}" != "${PREFIX}_"* ]]
     then
       continue
     fi
     date_echo "Deleting '${FTP_FILE}'"
     # Reroute STDOUT to null due to excessive outputs
-    curl --silent --ftp-method nocwd "${XORO_URL}" -Q "-DELE ${FTP_FILE}" > /dev/null
+    if ! curl "${CURL_OPTS[@]}" "${XORO_URL}" -Q "-DELE ${FTP_FILE}" > /dev/null
+    then
+      date_echo "WARNING: Failed to delete '${FTP_FILE}'"
+    fi
   done <<< "${CURL_FILES}"
 }
 
@@ -122,7 +159,7 @@ upload_new_files_to_ftp() {
 
     date_echo "Uploading '${MYFILE}' as '${NEW_FILENAME}'"
     # This command may fail when space is running low
-    if curl --silent --show-error --globoff --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
+    if curl "${CURL_OPTS[@]}" -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
     then
       # Only add to state file if upload succeeded
       echo "${MYFILE}" >> "${STATE_FILE}"
@@ -276,48 +313,54 @@ update_state_file() {
 }
 
 
+exec 9> "${LOCK_FILE}"
+if ! flock --nonblock 9
+then
+  date_echo "ERROR: Another instance holds ${LOCK_FILE}, exiting."
+  exit 1
+fi
+
+# Survive SSH disconnects; INT/TERM exit via the EXIT trap
+trap '' SIGHUP
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+
 date_echo "Started"
 
 # Check initial online status first
-if ! ping -c 1 -w 5 ${XORO_HOST}
+if ! ping -c 1 -w 5 "${XORO_HOST}"
 then
   date_echo "Device ${XORO_HOST} offline. Trying IP."
-  if ping -c 1 -w 5 ${XORO_IP}
+  if ping -c 1 -w 5 "${XORO_IP}"
   then
     date_echo "Using IP ${XORO_IP} instead of hostname."
     XORO_HOST="${XORO_IP}"
   else
     date_echo "IP ${XORO_IP} offline as well. Ending script."
-    exit
+    exit 1
   fi
 fi
 XORO_URL="${XORO_PROTOCOL}://${XORO_HOST}:${XORO_PORT}"
 
-# Ignore a couple of signals
-trap '' SIGINT SIGHUP SIGQUIT SIGTERM SIGSTOP
-
-if [[ -n ${2} && -d ${2} ]]
+if [[ -n "${PICTURE_DIR}" ]]
 then
   # Create temp file for caching picture list (avoids multiple expensive find operations)
-  PICTURE_CACHE=$(mktemp)
-  trap "rm -f ${PICTURE_CACHE}" EXIT
+  PICTURE_CACHE="$(mktemp)"
+  trap 'rm -f "${PICTURE_CACHE}"' EXIT
 
   # Discover all pictures once and cache results
-  TOTAL_AVAILABLE_PICS=$(discover_pictures "${2}" "${PICTURE_CACHE}")
+  TOTAL_AVAILABLE_PICS="$(discover_pictures "${PICTURE_DIR}" "${PICTURE_CACHE}")"
 
   # Handle edge case: no pictures found
   if (( TOTAL_AVAILABLE_PICS == 0 ))
   then
-    date_echo "WARNING: No pictures found in ${2}, skipping upload"
+    date_echo "WARNING: No pictures found in ${PICTURE_DIR}, skipping upload"
   else
-    delete_all_ftp_files
+    delete_uploaded_ftp_files
     upload_new_files_to_ftp "${PICTURE_CACHE}"
     cleanup_state_file
     update_state_file "${TOTAL_AVAILABLE_PICS}"
   fi
-
-  # Cleanup temp file
-  rm -f "${PICTURE_CACHE}"
 fi
 
 #rename_ftp_files
