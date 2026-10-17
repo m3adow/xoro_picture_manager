@@ -1,18 +1,34 @@
 #!/bin/bash
 set -Eeuo pipefail
-set -x
+
+if (( $# < 1 || $# > 2 ))
+then
+  echo "Usage: ${0} <values.env> [picture directory]" >&2
+  exit 1
+fi
 
 # Source the env file
-source ${1}
+# shellcheck source=/dev/null
+source "${1}"
+
+if [[ "${DEBUG:-false}" == "true" ]]
+then
+  set -x
+fi
 
 XORO_PROTOCOL="ftp"
 XORO_PORT="${XORO_PORT:-"2121"}"
 
-# Full prefix will be '$PREFIX_$RANDOM__' (two underscores)
+# Uploaded files are named '<PREFIX>_<counter>_<original name>'
 PREFIX="${PREFIX:-"XPM"}"
-# Everything not being "sd" or "SD" is handled the same
+# Space-separated MIME types to upload; the Xoro manual only documents JPEG
+ALLOWED_MIME_TYPES="${ALLOWED_MIME_TYPES:-"image/jpeg"}"
+# Anything but "sd" (any case) means internal storage
 STORAGE="${STORAGE:-internal}"
-UPLOAD_RETRIES="${UPLOAD_RETRIES:-10}"
+# Max seconds to wait for the frame after a reboot
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-"300"}"
+# Abort uploading after this many failures (formerly UPLOAD_RETRIES)
+MAX_UPLOAD_FAILURES="${MAX_UPLOAD_FAILURES:-"${UPLOAD_RETRIES:-"10"}"}"
 
 # Copy this amount of pics
 MAX_PICS="${MAX_PICS:-"100"}"
@@ -21,16 +37,45 @@ MAX_PICS="${MAX_PICS:-"100"}"
 COVERAGE_PERCENTAGE="${COVERAGE_PERCENTAGE:-"80"}"
 # File to save uploaded file paths to prevent repeats until COVERAGE_PERCENTAGE met
 STATE_FILE="${STATE_FILE:-"/var/tmp/xoro_pictures.state"}"
+LOCK_FILE="${LOCK_FILE:-"${STATE_FILE}.lock"}"
+CURL_OPTS=(--silent --show-error --globoff --ftp-method nocwd --connect-timeout 10 --max-time 300)
+
+for VAR in XORO_PORT BOOT_TIMEOUT MAX_UPLOAD_FAILURES MAX_PICS COVERAGE_PERCENTAGE
+do
+  if [[ ! "${!VAR}" =~ ^[1-9][0-9]*$ ]]
+  then
+    echo "ERROR: ${VAR} must be a positive integer, got '${!VAR}'." >&2
+    exit 1
+  fi
+done
 
 # Validate COVERAGE_PERCENTAGE is between 1 and 100
 if (( COVERAGE_PERCENTAGE < 1 || COVERAGE_PERCENTAGE > 100 ))
 then
-  echo "ERROR: COVERAGE_PERCENTAGE must be between 1 and 100, got ${COVERAGE_PERCENTAGE}."
+  echo "ERROR: COVERAGE_PERCENTAGE must be between 1 and 100, got ${COVERAGE_PERCENTAGE}." >&2
   exit 1
+fi
+
+PICTURE_DIR=""
+if (( $# == 2 ))
+then
+  if [[ ! -d "${2}" ]]
+  then
+    echo "ERROR: Picture directory '${2}' does not exist." >&2
+    exit 1
+  fi
+  PICTURE_DIR="$(realpath "${2}")"
 fi
 
 date_echo() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): ${1}"
+}
+
+trap 'RC=$?; date_echo "ERROR: \"${BASH_COMMAND}\" failed with exit code ${RC} at line ${LINENO}" >&2' ERR
+
+# Keep the lock fd away from the daemonized adb server
+adb() {
+  command adb "$@" 9>&-
 }
 
 discover_pictures() {
@@ -42,28 +87,38 @@ discover_pictures() {
   # Send logs to stderr to avoid polluting stdout (which is captured)
   date_echo "Discovering pictures in ${PICTURE_DIR} (this may take a while for large collections)" >&2
 
-  # Find all images and save to cache file
-  find "${PICTURE_DIR}" -type f -exec file --mime-type {} \+ \
-    | awk -F: '{if ($2 ~/image\//) print $1}' \
+  # Find all displayable images and save to cache file
+  find "${PICTURE_DIR}" -type f -exec file --mime-type --no-pad --separator $'\t' {} \+ \
+    | awk -F'\t' -v allowed="${ALLOWED_MIME_TYPES}" '
+        BEGIN { split(allowed, types, " "); for (i in types) ok[types[i]] = 1 }
+        { sub(/^ /, "", $2); if ($2 in ok) print $1 }' \
     > "${CACHE_FILE}"
 
-  local TOTAL=$(wc -l < "${CACHE_FILE}")
+  local TOTAL
+  TOTAL="$(wc -l < "${CACHE_FILE}")"
   date_echo "Found ${TOTAL} total pictures" >&2
 
   # Only output the count to stdout (this is what gets captured)
   echo "${TOTAL}"
 }
 
-delete_all_ftp_files() {
-  local CURL_FILES="$(curl --ftp-method nocwd --silent --list-only "${XORO_URL}")"
-  # Set IFS to newline only due to spaces in file names
-  IFS=$'\n'
-  for FTP_FILE in ${CURL_FILES}
+delete_uploaded_ftp_files() {
+  local CURL_FILES
+  CURL_FILES="$(curl "${CURL_OPTS[@]}" --list-only "${XORO_URL}")"
+  local FTP_FILE
+  while IFS= read -r FTP_FILE
   do
+    if [[ "${FTP_FILE}" != "${PREFIX}_"* ]]
+    then
+      continue
+    fi
     date_echo "Deleting '${FTP_FILE}'"
     # Reroute STDOUT to null due to excessive outputs
-    curl --silent --ftp-method nocwd "${XORO_URL}" -Q "-DELE ${FTP_FILE}" > /dev/null
-  done
+    if ! curl "${CURL_OPTS[@]}" "${XORO_URL}" -Q "-DELE ${FTP_FILE}" > /dev/null
+    then
+      date_echo "WARNING: Failed to delete '${FTP_FILE}'"
+    fi
+  done <<< "${CURL_FILES}"
 }
 
 upload_new_files_to_ftp() {
@@ -73,15 +128,17 @@ upload_new_files_to_ftp() {
   touch "${STATE_FILE}"
 
   # Use cached picture list, filter by state file, randomize and limit
-  local IMAGES="$(grep -vf ${STATE_FILE} "${PICTURE_CACHE}" | shuf -n ${MAX_PICS})"
+  # grep exits 1 when every picture is already in the state file
+  local IMAGES
+  IMAGES="$( { grep -vxFf "${STATE_FILE}" "${PICTURE_CACHE}" || (( $? == 1 )); } | shuf -n "${MAX_PICS}")"
 
   # Check if any pictures available
   if [[ -z "${IMAGES}" ]]
   then
     date_echo "WARNING: No new pictures available (all in state file). Resetting state to start fresh cycle."
-    > "${STATE_FILE}"  # Empty the state file
+    : > "${STATE_FILE}"  # Empty the state file
     # Retry using cached list now that state is clear
-    IMAGES="$(cat "${PICTURE_CACHE}" | sort --random-sort | head -n ${MAX_PICS})"
+    IMAGES="$(shuf -n "${MAX_PICS}" "${PICTURE_CACHE}")"
 
     if [[ -z "${IMAGES}" ]]
     then
@@ -92,15 +149,19 @@ upload_new_files_to_ftp() {
 
   local FAILURE_COUNT=0
   local SUCCESS_COUNT=0
-  IFS=$'\n'
-  for MYFILE in ${IMAGES}
+  local COUNTER=0
+  local MYFILE SAFE_NAME NEW_FILENAME
+  while IFS= read -r MYFILE
   do
-    # Create a new file name to randomise order
-    NEW_FILENAME="${PREFIX}_${RANDOM}_$(basename "${MYFILE}")"
+    # Frame sorts by name: counter keeps shuffle order; names must be URL-safe
+    COUNTER=$((COUNTER + 1))
+    SAFE_NAME="$(basename "${MYFILE}")"
+    SAFE_NAME="${SAFE_NAME//[^A-Za-z0-9._-]/_}"
+    printf -v NEW_FILENAME '%s_%0*d_%s' "${PREFIX}" "${#MAX_PICS}" "${COUNTER}" "${SAFE_NAME}"
 
     date_echo "Uploading '${MYFILE}' as '${NEW_FILENAME}'"
     # This command may fail when space is running low
-    if curl --silent --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
+    if curl "${CURL_OPTS[@]}" -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
     then
       # Only add to state file if upload succeeded
       echo "${MYFILE}" >> "${STATE_FILE}"
@@ -110,15 +171,15 @@ upload_new_files_to_ftp() {
       date_echo "ERROR: Failed to upload '${MYFILE}'"
     fi
 
-    # Try the next file until retries are reached
-    if (( $FAILURE_COUNT < $UPLOAD_RETRIES ))
+    # Try the next file until the failure limit is reached
+    if (( FAILURE_COUNT < MAX_UPLOAD_FAILURES ))
     then
       continue
     else
-      date_echo "Upload retry limit reached (${UPLOAD_RETRIES} failures)"
+      date_echo "Upload failure limit reached (${MAX_UPLOAD_FAILURES} failures)"
       break
     fi
-  done
+  done <<< "${IMAGES}"
 
   date_echo "Upload complete: ${SUCCESS_COUNT} succeeded, ${FAILURE_COUNT} failed"
 }
@@ -126,8 +187,11 @@ upload_new_files_to_ftp() {
 reactivate_xoro() {
   date_echo "Reactivating Xoro"
 
+  local ADB_SERIAL="${XORO_HOST}:5555"
+  local GALLERY_ACTIVITY="com.allwinner.theatreplayer.album/.ui.GalleryActivity"
+
   # Connect to Xoro
-  if ! adb connect ${XORO_HOST}
+  if ! adb connect "${XORO_HOST}"
   then
     date_echo "ERROR: Failed to connect to device via ADB at ${XORO_HOST}"
     return 1
@@ -137,34 +201,44 @@ reactivate_xoro() {
 
   # Restart the device (couldn't figure out how to reindex files after rename)
   # Has to be OR'd with true due to -e
-  adb shell reboot
+  adb -s "${ADB_SERIAL}" shell reboot || true
   # Sometimes reboot returns too fast, so wait 5 secs to be sure device is offline
   sleep 5
   adb kill-server
 
   # Wait for the device to become responsive again
-  while ! nc -z ${XORO_HOST} 5555; do
-      sleep 5 # wait for 1/10 of the second before check again
+  local WAITED=0
+  until nc -z -w 5 "${XORO_HOST}" 5555
+  do
+    if (( WAITED >= BOOT_TIMEOUT ))
+    then
+      date_echo "ERROR: ${XORO_HOST} did not come back within ${BOOT_TIMEOUT} seconds"
+      return 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
   done
   # Sleep additional time afterwards to be safe
   sleep 5
 
-  adb connect ${XORO_HOST}
+  adb connect "${XORO_HOST}"
   # Start the Gallery activity, no idea why it fails sometimes
-  adb shell "am start com.allwinner.theatreplayer.album/.ui.GalleryActivity" || \
-    sleep 5; adb shell "am start com.allwinner.theatreplayer.album/.ui.GalleryActivity"
+  adb -s "${ADB_SERIAL}" shell "am start ${GALLERY_ACTIVITY}" || {
+    sleep 5
+    adb -s "${ADB_SERIAL}" shell "am start ${GALLERY_ACTIVITY}"
+  }
   # The app takes some time to start
   sleep 5
   # Send three "RIGHT" key strokes, going to internal storage
   # More than two in a row don't get detected properly sometimes
-  adb shell "input keyevent 22 / 22"
+  adb -s "${ADB_SERIAL}" shell "input keyevent 22 22"
   sleep 1
-  adb shell "input keyevent 22"
+  adb -s "${ADB_SERIAL}" shell "input keyevent 22"
   # If SD is used, send one additional stroke
-  if [[ "${STORAGE}" =~ "[sS][Dd]" ]]
+  if [[ "${STORAGE,,}" == "sd" ]]
   then
     sleep 1
-    adb shell "input keyevent 22"
+    adb -s "${ADB_SERIAL}" shell "input keyevent 22"
   fi
   # Stop adb again
   adb kill-server
@@ -179,7 +253,8 @@ cleanup_state_file() {
       return
     fi
 
-    local TEMP_STATE=$(mktemp)
+    local TEMP_STATE
+    TEMP_STATE="$(mktemp "${STATE_FILE}.XXXXXX")"
     local REMOVED_COUNT=0
 
     while IFS= read -r PICTURE_PATH
@@ -203,7 +278,8 @@ cleanup_state_file() {
 
 update_state_file() {
     local TOTAL_PICS="${1}"
-    local STATE_COUNT=$(wc -l "${STATE_FILE}" | cut -d ' ' -f1)
+    local STATE_COUNT
+    STATE_COUNT="$(wc -l < "${STATE_FILE}")"
 
     # Calculate coverage threshold based on total available pictures
     local THRESHOLD=$(( TOTAL_PICS * COVERAGE_PERCENTAGE / 100 ))
@@ -241,50 +317,55 @@ update_state_file() {
 }
 
 
+exec 9> "${LOCK_FILE}"
+if ! flock --nonblock 9
+then
+  date_echo "ERROR: Another instance holds ${LOCK_FILE}, exiting."
+  exit 1
+fi
+
+# Survive SSH disconnects; INT/TERM exit via the EXIT trap
+trap '' SIGHUP
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+
 date_echo "Started"
 
 # Check initial online status first
-if ! ping -c 1 -w 5 ${XORO_HOST}
+if ! ping -c 1 -w 5 "${XORO_HOST}"
 then
   date_echo "Device ${XORO_HOST} offline. Trying IP."
-  if ping -c 1 -w 5 ${XORO_IP}
+  if ping -c 1 -w 5 "${XORO_IP}"
   then
     date_echo "Using IP ${XORO_IP} instead of hostname."
     XORO_HOST="${XORO_IP}"
   else
     date_echo "IP ${XORO_IP} offline as well. Ending script."
-    exit
+    exit 1
   fi
 fi
 XORO_URL="${XORO_PROTOCOL}://${XORO_HOST}:${XORO_PORT}"
 
-# Ignore a couple of signals
-trap '' SIGINT SIGHUP SIGQUIT SIGTERM SIGSTOP
-
-if [[ -n ${2} && -d ${2} ]]
+if [[ -n "${PICTURE_DIR}" ]]
 then
   # Create temp file for caching picture list (avoids multiple expensive find operations)
-  PICTURE_CACHE=$(mktemp)
-  trap "rm -f ${PICTURE_CACHE}" EXIT
+  PICTURE_CACHE="$(mktemp)"
+  trap 'rm -f "${PICTURE_CACHE}"' EXIT
 
   # Discover all pictures once and cache results
-  TOTAL_AVAILABLE_PICS=$(discover_pictures "${2}" "${PICTURE_CACHE}")
+  TOTAL_AVAILABLE_PICS="$(discover_pictures "${PICTURE_DIR}" "${PICTURE_CACHE}")"
 
   # Handle edge case: no pictures found
   if (( TOTAL_AVAILABLE_PICS == 0 ))
   then
-    date_echo "WARNING: No pictures found in ${2}, skipping upload"
+    date_echo "WARNING: No pictures found in ${PICTURE_DIR}, skipping upload"
   else
-    delete_all_ftp_files
+    delete_uploaded_ftp_files
     upload_new_files_to_ftp "${PICTURE_CACHE}"
     cleanup_state_file
     update_state_file "${TOTAL_AVAILABLE_PICS}"
   fi
-
-  # Cleanup temp file
-  rm -f "${PICTURE_CACHE}"
 fi
 
-#rename_ftp_files
 reactivate_xoro
 date_echo "Ended"
