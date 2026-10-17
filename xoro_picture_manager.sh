@@ -1,9 +1,13 @@
 #!/bin/bash
 set -Eeuo pipefail
-set -x
 
 # Source the env file
 source ${1}
+
+if [[ "${DEBUG:-false}" == "true" ]]
+then
+  set -x
+fi
 
 XORO_PROTOCOL="ftp"
 XORO_PORT="${XORO_PORT:-"2121"}"
@@ -32,6 +36,8 @@ fi
 date_echo() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): ${1}"
 }
+
+trap 'RC=$?; date_echo "ERROR: \"${BASH_COMMAND}\" failed with exit code ${RC} at line ${LINENO}" >&2' ERR
 
 discover_pictures() {
   # Run expensive find command once and cache results in temp file
