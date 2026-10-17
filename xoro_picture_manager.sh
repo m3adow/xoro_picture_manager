@@ -12,8 +12,10 @@ fi
 XORO_PROTOCOL="ftp"
 XORO_PORT="${XORO_PORT:-"2121"}"
 
-# Full prefix will be '$PREFIX_$RANDOM__' (two underscores)
+# Uploaded files are named '<PREFIX>_<counter>_<original name>'
 PREFIX="${PREFIX:-"XPM"}"
+# Space-separated MIME types to upload; the Xoro manual only documents JPEG
+ALLOWED_MIME_TYPES="${ALLOWED_MIME_TYPES:-"image/jpeg"}"
 # Anything but "sd" (any case) means internal storage
 STORAGE="${STORAGE:-internal}"
 # Max seconds to wait for the frame after a reboot
@@ -50,9 +52,11 @@ discover_pictures() {
   # Send logs to stderr to avoid polluting stdout (which is captured)
   date_echo "Discovering pictures in ${PICTURE_DIR} (this may take a while for large collections)" >&2
 
-  # Find all images and save to cache file
-  find "${PICTURE_DIR}" -type f -exec file --mime-type {} \+ \
-    | awk -F: '{if ($2 ~/image\//) print $1}' \
+  # Find all displayable images and save to cache file
+  find "${PICTURE_DIR}" -type f -exec file --mime-type --no-pad --separator $'\t' {} \+ \
+    | awk -F'\t' -v allowed="${ALLOWED_MIME_TYPES}" '
+        BEGIN { split(allowed, types, " "); for (i in types) ok[types[i]] = 1 }
+        { sub(/^ /, "", $2); if ($2 in ok) print $1 }' \
     > "${CACHE_FILE}"
 
   local TOTAL=$(wc -l < "${CACHE_FILE}")
@@ -65,14 +69,17 @@ discover_pictures() {
 delete_all_ftp_files() {
   local CURL_FILES
   CURL_FILES="$(curl --ftp-method nocwd --silent --show-error --list-only "${XORO_URL}")"
-  # Set IFS to newline only due to spaces in file names
-  IFS=$'\n'
-  for FTP_FILE in ${CURL_FILES}
+  local FTP_FILE
+  while IFS= read -r FTP_FILE
   do
+    if [[ -z "${FTP_FILE}" ]]
+    then
+      continue
+    fi
     date_echo "Deleting '${FTP_FILE}'"
     # Reroute STDOUT to null due to excessive outputs
     curl --silent --ftp-method nocwd "${XORO_URL}" -Q "-DELE ${FTP_FILE}" > /dev/null
-  done
+  done <<< "${CURL_FILES}"
 }
 
 upload_new_files_to_ftp() {
@@ -103,15 +110,19 @@ upload_new_files_to_ftp() {
 
   local FAILURE_COUNT=0
   local SUCCESS_COUNT=0
-  IFS=$'\n'
-  for MYFILE in ${IMAGES}
+  local COUNTER=0
+  local MYFILE SAFE_NAME NEW_FILENAME
+  while IFS= read -r MYFILE
   do
-    # Create a new file name to randomise order
-    NEW_FILENAME="${PREFIX}_${RANDOM}_$(basename "${MYFILE}")"
+    # Frame sorts by name: counter keeps shuffle order; names must be URL-safe
+    COUNTER=$((COUNTER + 1))
+    SAFE_NAME="$(basename "${MYFILE}")"
+    SAFE_NAME="${SAFE_NAME//[^A-Za-z0-9._-]/_}"
+    printf -v NEW_FILENAME '%s_%0*d_%s' "${PREFIX}" "${#MAX_PICS}" "${COUNTER}" "${SAFE_NAME}"
 
     date_echo "Uploading '${MYFILE}' as '${NEW_FILENAME}'"
     # This command may fail when space is running low
-    if curl --silent --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
+    if curl --silent --show-error --globoff --ftp-method nocwd -T "${MYFILE}" "${XORO_URL}/${NEW_FILENAME}"
     then
       # Only add to state file if upload succeeded
       echo "${MYFILE}" >> "${STATE_FILE}"
@@ -129,7 +140,7 @@ upload_new_files_to_ftp() {
       date_echo "Upload retry limit reached (${UPLOAD_RETRIES} failures)"
       break
     fi
-  done
+  done <<< "${IMAGES}"
 
   date_echo "Upload complete: ${SUCCESS_COUNT} succeeded, ${FAILURE_COUNT} failed"
 }
