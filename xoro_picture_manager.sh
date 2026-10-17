@@ -61,7 +61,8 @@ discover_pictures() {
 }
 
 delete_all_ftp_files() {
-  local CURL_FILES="$(curl --ftp-method nocwd --silent --list-only "${XORO_URL}")"
+  local CURL_FILES
+  CURL_FILES="$(curl --ftp-method nocwd --silent --show-error --list-only "${XORO_URL}")"
   # Set IFS to newline only due to spaces in file names
   IFS=$'\n'
   for FTP_FILE in ${CURL_FILES}
@@ -79,15 +80,17 @@ upload_new_files_to_ftp() {
   touch "${STATE_FILE}"
 
   # Use cached picture list, filter by state file, randomize and limit
-  local IMAGES="$(grep -vf ${STATE_FILE} "${PICTURE_CACHE}" | shuf -n ${MAX_PICS})"
+  # grep exits 1 when every picture is already in the state file
+  local IMAGES
+  IMAGES="$( { grep -vxFf "${STATE_FILE}" "${PICTURE_CACHE}" || (( $? == 1 )); } | shuf -n "${MAX_PICS}")"
 
   # Check if any pictures available
   if [[ -z "${IMAGES}" ]]
   then
     date_echo "WARNING: No new pictures available (all in state file). Resetting state to start fresh cycle."
-    > "${STATE_FILE}"  # Empty the state file
+    : > "${STATE_FILE}"  # Empty the state file
     # Retry using cached list now that state is clear
-    IMAGES="$(cat "${PICTURE_CACHE}" | sort --random-sort | head -n ${MAX_PICS})"
+    IMAGES="$(shuf -n "${MAX_PICS}" "${PICTURE_CACHE}")"
 
     if [[ -z "${IMAGES}" ]]
     then
